@@ -277,7 +277,11 @@ def process_file_with_claude(uploaded_file):
 
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=4096,
+            max_tokens=16000,
+            thinking={
+                "type": "enabled",
+                "budget_tokens": 5000,
+            },
             system=[
                 {
                     "type": "text",
@@ -307,7 +311,13 @@ def process_file_with_claude(uploaded_file):
         )
 
         st.write("✅ Extracción completada.")
-        raw_text = response.content[0].text.strip()
+        # Con thinking activado, el array content puede tener bloques de tipo
+        # "thinking" antes del bloque "text". Buscamos el texto explícitamente.
+        text_block = next((b for b in response.content if b.type == "text"), None)
+        if not text_block:
+            st.error("❌ Claude no devolvió un bloque de texto en la respuesta.")
+            return []
+        raw_text = text_block.text.strip()
 
         raw_data = robust_json_loads(raw_text)
 
@@ -465,6 +475,25 @@ def main():
         final_df = st.session_state['processed_results']
         st.divider()
         st.write("### Resultados Extraídos")
+
+        # --- MÉTRICAS DE RESUMEN ---
+        total_tx = len(final_df)
+
+        def sum_col(df, col):
+            if col not in df.columns:
+                return 0.0
+            numeric = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+            return numeric.sum()
+
+        total_credit = sum_col(final_df, "Amount Credit")
+        total_debit  = sum_col(final_df, "Amount Debit")
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("🔢 Transacciones", f"{total_tx:,}")
+        m2.metric("💚 Total Créditos", f"${total_credit:,.2f}")
+        m3.metric("🔴 Total Débitos",  f"${total_debit:,.2f}")
+
+        st.divider()
 
         edited_df = st.data_editor(final_df, num_rows="dynamic", key="results_editor", use_container_width=True)
 
