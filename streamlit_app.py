@@ -11,7 +11,7 @@ import base64
 from datetime import datetime
 
 # --- CONFIGURACIÓN ---
-st.set_page_config(page_title="Procesador de Bank Statements", layout="wide")
+st.set_page_config(page_title="Procesador de Bank Statements - Claude", layout="wide")
 
 if "SUPABASE_URL" not in st.secrets or "SUPABASE_KEY" not in st.secrets:
     st.error("❌ Faltan las credenciales en .streamlit/secrets.toml")
@@ -73,46 +73,82 @@ def save_to_history(filename, file_hash, raw_data):
         st.warning(f"⚠️ No se pudo guardar en el historial (Error DB): {e}")
 
 # --- EXTRACCIÓN CON CLAUDE ---
-EXTRACTION_INSTRUCTIONS = (
-    "Role: Bank statement transaction extractor for business checking statements (Chase and other banks).\n\n"
-    "Goals:\n"
-    "- Extract ONLY transactions listed under the deposits section of the statement.\n"
-    "- STOP extracting immediately when the deposits section ends.\n"
-    "- The deposits section ends when any of the following section headers appear: \"CHECKS PAID\", "
-    "\"ELECTRONIC WITHDRAWALS\", \"FEES\", \"OTHER WITHDRAWALS\", \"DEBITS\", or any other new section "
-    "header that is not a continuation of deposits.\n"
-    "- Do NOT extract any checks, withdrawals, fees, or any transaction from any other section under any circumstance.\n"
-    "- Extract each deposit as a separate row.\n\n"
-    "Instructions:\n"
-    "1. Transaction date: Use the date shown in the DATE column. Format as MM/DD/YYYY.\n"
-    "2. Transaction description: Use the full description text as shown in the statement.\n"
-    "3. Amount: Always positive (deposits). Preserve exact amounts including decimals.\n"
-    "4. Transaction type: Always \"Deposit\" for all rows.\n"
-    "5. Account number: Use the account number shown on the statement.\n"
-    "6. Names: Apply the following rules to determine the name:\n"
-    "   - If the description mentions any credit card processor → \"credit card\"\n"
-    "   - Credit card processors include (but are not limited to): Toast, Square, Stripe, PayPal, Heartland, "
-    "Clover, Fiserv, WorldPay, Braintree, Adyen, Elavon, First Data, Global Payments, TSYS, Payroc, Paysafe, "
-    "Gravity Payments, Shift4, Fattmerchant, Stax, Payanywhere, Dharma, PaySimple, iZettle, SumUp, Zettle, "
-    "Poynt, Vend, Lightspeed, Revel, NCR, Aloha, Micros, Silverware, Omnivore, Breadcrumb, TouchBistro, "
-    "Upserve, Lavu, Cake, Harbortouch, Talech, Shopkeep, Bindo, Epos Now, Nobly, Tillpoint, Erply, Hike, "
-    "Kounta, iConnect, Springboard, AccuPOS, pcAmerica, CAM Commerce, Aldelo, Dinerware, Digital Dining, "
-    "Focus POS, Future POS, Positouch, Prism, Squirrel, Xpient, Pixel Point\n"
-    "   - If the description mentions \"Doordash\", \"DoorDash\", \"Uber\", \"Grubhub\", \"Instacart\", "
-    "\"EZCater\", \"Caviar\", or \"Postmates\" → \"cash\"\n"
-    "   - If the description is a plain deposit (e.g. \"Deposit 1295512367\") → \"cash\"\n"
-    "   - If the description mentions \"ODP Transfer\", \"Online Transfer\", or any internal bank transfer → \"cash\"\n"
-    "   - For any other deposit not covered above → \"cash\"\n\n"
-    "High-Importance Rules:\n"
-    "- ONLY extract rows from the deposits section. Stop at any new section header.\n"
-    "- Do NOT extract check numbers, check amounts, or anything from the \"CHECKS PAID\" section.\n"
-    "- Do not skip any deposit row within the deposits section.\n"
-    "- Names must only be \"cash\" or \"credit card\" — no other values allowed.\n"
-    "- Ignore completely any row that appears after the deposits section ends.\n\n"
-    "Return ONLY a valid JSON array of objects. Each object must have exactly these keys:\n"
-    "\"Transaction date\", \"Transaction description\", \"Amount\", \"Transaction type\", \"Account number\", \"Names\".\n"
-    "No markdown, no explanation, no extra text — only the JSON array."
-)
+EXTRACTION_INSTRUCTIONS = """Extract all transactions from this bank statement and return them as a 
+            table with these exact columns: Date, Description, Source, Ref Number, 
+            Account Number, Amount Debit, Amount Credit, Class.
+             
+            Rules:
+             
+            - Date: use MM/DD/YY format
+             
+            - Description: the full transaction description as it appears in the statement
+             
+            - Source: extract a clean, readable name of who sent or received the money.
+              For example:
+              * "WITHDRAWAL -TOLTECA FOODS Tolteca FO FT423437204" → "Tolteca Foods"
+              * "Orig CO Name:Toast Orig ID:1201361000..." → "Toast"
+              * "Orig CO Name:Uber USA 6787..." → "Uber Eats"
+              * "WITHDRAWAL -IRS USATAXPYMT" → "IRS"
+              * "Zelle Payment To Juan Jose..." → "Zelle - Juan Jose"
+              * "WITHDRAWAL -ATT PAYMENT..." → "AT&T"
+              * "POS DB SUPERLO FO..." → "Superlo Foods"
+              * "Online Transfer To Chk...3920" → "Internal Transfer - Acct 3920"
+              * For checks, use the payee name visible on the check image if available,
+                otherwise leave blank
+              Strip out all reference numbers, trace numbers, account codes, 
+              and technical identifiers. Return only the human-readable name.
+             
+            - Ref Number: 
+              * For checks: the check number (e.g. "3245", "15087")
+              * For all other transactions: leave blank
+             
+            - Account Number: the account number associated with this transaction 
+              as it appears on the statement (e.g. "00220006508677", 
+              "000000203031197"). If the document contains multiple accounts, 
+              use the correct account number for each transaction. 
+              If only one account exists in the document, repeat it for every row.
+             
+            - Amount Debit: the withdrawal/debit amount as a positive number, 
+              leave blank if not applicable. If the document has columns or sections for withdrawals/debits take care from this.
+              * "Online Transfer to..." → Amount Debit (money leaving the account)
+              * "Zelle to..." → Amount Debit
+              * "WF Direct Pay-Payment-..." → Amount Debit
+              * "Business to Business ACH Debit..." → Amount Debit
+             
+            - Amount Credit: the deposit/credit amount as a positive number, 
+              leave blank if not applicable. If the document has columns or sections for deposits/credits take care from this.
+              * "Bankcard Dep..." → Amount Credit
+              * "Doordash, Inc...." → Amount Credit
+              * "Online Transfer From..." → Amount Credit
+              * "ODP Transfer From..." → Amount Credit
+             
+            - Class: classify each transaction using ONLY these four values:
+              * "Credit Card" — for any transaction involving payment processors 
+                or credit card activity, including: Stripe, Square, Toast, EPX, 
+                Merchant Bankcd, Clover, Doordash, Uber Eats, Grubhub, Chase 
+                Credit Card, credit card autopay, or any merchant settlement
+              * "Transfer" — for any online transfer, ACH, wire, Zelle, ODP 
+                transfer, internal bank transfer between accounts, or any 
+                transaction labeled "Transfer", "Online Transfer", "ACH", or "Zelle"
+              * "Check" — for any transaction paid by check, identified by a 
+                check number in the Checks Paid section or in the account history
+              * "Cash" — for everything else, including vendor ACH payments, 
+                tax payments, payroll, utilities, insurance, rent, subscriptions, 
+                and ATM withdrawals
+             
+            Important:
+            - Include every single transaction without exception
+            - Do not skip any rows or summarize — one row per transaction
+            - Do not include opening balance, ending balance, or summary rows
+            - Checks always go in Class "Check", never in "Transfer" or "Cash"
+            - Never skip the first transaction row of any page. if a page begin with a transaction row (no section header), extract it. It is a continuation of the previous section.
+            - The word "FROM" in a transfer description always means money is entering the account → Amount Credit.
+            - The word "TO" in a transfer description always means money is leaving the account → Amount Debit.
+            - This applies regardless of how the transaction is labeled (Transfer, Zelle, Online Transfer, Wire, etc.)
+            - Use the section header of the statement (Deposits/Credits vs Withdrawals/Debits) to determine the correct column for any ambiguous transaction. Example: "Deposited OR Cashed Check" please check the column or section (Debit or Credit).
+            - If a page does not have a section header, assume it is a continuation of the last active section from the previous page. Use the section context to determine the correct amount column.
+            -No markdown, no explanation, no extra text — only the JSON array."""
+
 
 
 def process_file_with_claude(uploaded_file):
