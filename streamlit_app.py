@@ -151,6 +151,116 @@ EXTRACTION_INSTRUCTIONS = """Extract all transactions from this bank statement a
 
 
 
+def repair_incomplete_json(s):
+    s = s.strip()
+    
+    # Clean up markdown fences if present
+    s = re.sub(r"^```(?:json)?\n?", "", s)
+    s = re.sub(r"\n?```$", "", s)
+    s = s.strip()
+
+    # Track state of container structures and string boundaries
+    stack = []
+    in_string = False
+    escape = False
+    
+    clean_chars = []
+    
+    for i, char in enumerate(s):
+        if escape:
+            clean_chars.append(char)
+            escape = False
+            continue
+            
+        if char == '\\':
+            clean_chars.append(char)
+            escape = True
+            continue
+            
+        if char == '"':
+            in_string = not in_string
+            clean_chars.append(char)
+            continue
+            
+        if in_string:
+            clean_chars.append(char)
+            continue
+            
+        if char == '{':
+            stack.append('}')
+            clean_chars.append(char)
+        elif char == '[':
+            stack.append(']')
+            clean_chars.append(char)
+        elif char == '}':
+            if stack and stack[-1] == '}':
+                stack.pop()
+                clean_chars.append(char)
+        elif char == ']':
+            if stack and stack[-1] == ']':
+                stack.pop()
+                clean_chars.append(char)
+        else:
+            clean_chars.append(char)
+
+    reconstructed = "".join(clean_chars)
+    
+    try:
+        return json.loads(reconstructed)
+    except Exception:
+        pass
+        
+    # Attempt to truncate at the last complete JSON object closing brace
+    last_complete_idx = reconstructed.rfind('}')
+    if last_complete_idx != -1:
+        part = reconstructed[:last_complete_idx + 1].strip()
+        if part.endswith(','):
+            part = part[:-1].strip()
+        if part.startswith('['):
+            part += ']'
+        elif not part.startswith('{'):
+            if s.startswith('['):
+                part = '[' + part + ']'
+            elif s.startswith('{'):
+                part = '{' + part + '}'
+                
+        try:
+            return json.loads(part)
+        except Exception:
+            pass
+            
+    # Fallback to closing all open container elements
+    reconstructed_closed = reconstructed
+    if in_string:
+        reconstructed_closed += '"'
+    reconstructed_closed = re.sub(r',\s*$', '', reconstructed_closed)
+    for container in reversed(stack):
+        reconstructed_closed += container
+        
+    try:
+        return json.loads(reconstructed_closed)
+    except Exception:
+        pass
+        
+    raise ValueError("Could not repair JSON")
+
+
+def robust_json_loads(s):
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    
+    # Try removing trailing commas inside arrays or objects
+    s_cleaned = re.sub(r',\s*([\]}])', r'\1', s)
+    try:
+        return json.loads(s_cleaned)
+    except Exception:
+        pass
+        
+    return repair_incomplete_json(s)
+
+
 def process_file_with_claude(uploaded_file):
     if not ANTHROPIC_API_KEY:
         st.error("❌ Falta configurar ANTHROPIC_API_KEY en secrets.toml")
@@ -189,7 +299,7 @@ def process_file_with_claude(uploaded_file):
                         },
                         {
                             "type": "text",
-                            "text": "Extract the deposit transactions from this bank statement following the instructions.",
+                            "text": "Extract all transactions from this bank statement following the instructions.",
                         },
                     ],
                 }
@@ -199,11 +309,7 @@ def process_file_with_claude(uploaded_file):
         st.write("✅ Extracción completada.")
         raw_text = response.content[0].text.strip()
 
-        # Strip markdown code fences if present
-        raw_text = re.sub(r"^```(?:json)?\n?", "", raw_text)
-        raw_text = re.sub(r"\n?```$", "", raw_text)
-
-        raw_data = json.loads(raw_text)
+        raw_data = robust_json_loads(raw_text)
 
         if raw_data:
             save_to_history(uploaded_file.name, file_hash, raw_data)
@@ -241,7 +347,7 @@ def clean_currency(value_str):
 def parse_response(raw_records):
     if isinstance(raw_records, str):
         try:
-            raw_records = json.loads(raw_records)
+            raw_records = robust_json_loads(raw_records)
         except Exception:
             pass
 
@@ -255,36 +361,64 @@ def parse_response(raw_records):
     processed_data = []
     for item in raw_records:
         if isinstance(item, dict):
-            tx_date = item.get('Transaction date') or ""
-            tx_desc = item.get('Transaction description') or ""
-            raw_amount = item.get('Amount') or "0"
-            tx_type = item.get('Transaction type') or ""
-            acc_num = item.get('Account number') or ""
-            names = item.get('Names') or ""
+            # Extract date (flexible keys)
+            tx_date = item.get('Date') or item.get('Transaction date') or item.get('date') or ""
+            
+            # Extract description
+            tx_desc = item.get('Description') or item.get('Transaction description') or item.get('description') or ""
+            
+            # Extract source / names
+            tx_source = item.get('Source') or item.get('Names') or item.get('names') or item.get('source') or ""
+            
+            # Extract ref number
+            ref_num = item.get('Ref Number') or item.get('Ref number') or item.get('ref_number') or ""
+            
+            # Extract account number
+            acc_num = item.get('Account Number') or item.get('Account number') or item.get('account_number') or ""
+            
+            # Extract class / type
+            tx_class = item.get('Class') or item.get('Transaction type') or item.get('class') or ""
+            
+            # Extract debit and credit amounts
+            amount_debit = item.get('Amount Debit') or item.get('Amount debit') or item.get('amount_debit') or ""
+            amount_credit = item.get('Amount Credit') or item.get('Amount credit') or item.get('amount_credit') or ""
+            
+            # Check if older format key 'Amount' was used as fallback
+            old_amount = item.get('Amount') or item.get('amount')
+            if old_amount and not amount_debit and not amount_credit:
+                cleaned_amt = clean_currency(old_amount)
+                if tx_class.lower() in ['credit card', 'deposit']:
+                    amount_credit = cleaned_amt
+                else:
+                    amount_debit = cleaned_amt
         elif isinstance(item, list):
             tx_date = str(item[0]) if len(item) >= 1 else ""
             tx_desc = str(item[1]) if len(item) >= 2 else ""
-            raw_amount = str(item[2]) if len(item) >= 3 else "0"
-            tx_type = str(item[3]) if len(item) >= 4 else ""
+            tx_source = str(item[2]) if len(item) >= 3 else ""
+            ref_num = str(item[3]) if len(item) >= 4 else ""
             acc_num = str(item[4]) if len(item) >= 5 else ""
-            names = str(item[5]) if len(item) >= 6 else ""
+            amount_debit = str(item[5]) if len(item) >= 6 else ""
+            amount_credit = str(item[6]) if len(item) >= 7 else ""
+            tx_class = str(item[7]) if len(item) >= 8 else ""
         else:
             continue
 
         formatted_date = tx_date
         if tx_date:
             try:
-                formatted_date = pd.to_datetime(tx_date).strftime('%m/%d/%Y')
+                formatted_date = pd.to_datetime(tx_date).strftime('%m/%d/%y')
             except Exception:
                 pass
 
         processed_data.append({
-            "Transaction date": formatted_date,
-            "Transaction description": tx_desc,
-            "Amount": clean_currency(raw_amount),
-            "Transaction type": tx_type,
-            "Account number": acc_num,
-            "Names": names,
+            "Date": formatted_date,
+            "Description": tx_desc,
+            "Source": tx_source,
+            "Ref Number": ref_num,
+            "Account Number": acc_num,
+            "Amount Debit": clean_currency(amount_debit) if amount_debit != "" else "",
+            "Amount Credit": clean_currency(amount_credit) if amount_credit != "" else "",
+            "Class": tx_class,
         })
 
     return processed_data
@@ -336,8 +470,8 @@ def main():
 
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            edited_df.to_excel(writer, index=False, sheet_name='Deposits')
-            worksheet = writer.sheets['Deposits']
+            edited_df.to_excel(writer, index=False, sheet_name='Transactions')
+            worksheet = writer.sheets['Transactions']
             for idx, col in enumerate(edited_df.columns):
                 series = edited_df[col]
                 max_len = min(max(series.astype(str).map(len).max(), len(str(col))) + 1, 50)
