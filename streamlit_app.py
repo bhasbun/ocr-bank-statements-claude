@@ -8,6 +8,7 @@ import io
 import re
 import hashlib
 import base64
+import traceback
 from datetime import datetime
 
 # --- CONFIGURACIÓN ---
@@ -73,83 +74,62 @@ def save_to_history(filename, file_hash, raw_data):
         st.warning(f"⚠️ No se pudo guardar en el historial (Error DB): {e}")
 
 # --- EXTRACCIÓN CON CLAUDE ---
-EXTRACTION_INSTRUCTIONS = """Extract all transactions from this bank statement and return them as a 
-            table with these exact columns: Date, Description, Source, Ref Number, 
-            Account Number, Amount Debit, Amount Credit, Class.
-             
-            Rules:
-             
-            - Date: use MM/DD/YY format
-             
-            - Description: the full transaction description as it appears in the statement
-             
-            - Source: extract a clean, readable name of who sent or received the money.
-              For example:
-              * "WITHDRAWAL -TOLTECA FOODS Tolteca FO FT423437204" → "Tolteca Foods"
-              * "Orig CO Name:Toast Orig ID:1201361000..." → "Toast"
-              * "Orig CO Name:Uber USA 6787..." → "Uber Eats"
-              * "WITHDRAWAL -IRS USATAXPYMT" → "IRS"
-              * "Zelle Payment To Juan Jose..." → "Zelle - Juan Jose"
-              * "WITHDRAWAL -ATT PAYMENT..." → "AT&T"
-              * "POS DB SUPERLO FO..." → "Superlo Foods"
-              * "Online Transfer To Chk...3920" → "Internal Transfer - Acct 3920"
-              * For checks, use the payee name visible on the check image if available,
-                otherwise leave blank
-              Strip out all reference numbers, trace numbers, account codes, 
-              and technical identifiers. Return only the human-readable name.
-             
-            - Ref Number: 
-              * For checks: the check number (e.g. "3245", "15087")
-              * For all other transactions: leave blank
-             
-            - Account Number: the account number associated with this transaction 
-              as it appears on the statement (e.g. "00220006508677", 
-              "000000203031197"). If the document contains multiple accounts, 
-              use the correct account number for each transaction. 
-              If only one account exists in the document, repeat it for every row.
-             
-            - Amount Debit: the withdrawal/debit amount as a positive number, 
-              leave blank if not applicable. If the document has columns or sections for withdrawals/debits take care from this.
-              * "Online Transfer to..." → Amount Debit (money leaving the account)
-              * "Zelle to..." → Amount Debit
-              * "WF Direct Pay-Payment-..." → Amount Debit
-              * "Business to Business ACH Debit..." → Amount Debit
-             
-            - Amount Credit: the deposit/credit amount as a positive number, 
-              leave blank if not applicable. If the document has columns or sections for deposits/credits take care from this.
-              * "Bankcard Dep..." → Amount Credit
-              * "Doordash, Inc...." → Amount Credit
-              * "Online Transfer From..." → Amount Credit
-              * "ODP Transfer From..." → Amount Credit
-             
-            - Class: classify each transaction using ONLY these four values:
-              * "Credit Card" — for any transaction involving payment processors 
-                or credit card activity, including: Stripe, Square, Toast, EPX, 
-                Merchant Bankcd, Clover, Doordash, Uber Eats, Grubhub, Chase 
-                Credit Card, credit card autopay, or any merchant settlement
-              * "Transfer" — for any online transfer, ACH, wire, Zelle, ODP 
-                transfer, internal bank transfer between accounts, or any 
-                transaction labeled "Transfer", "Online Transfer", "ACH", or "Zelle"
-              * "Check" — for any transaction paid by check, identified by a 
-                check number in the Checks Paid section or in the account history
-              * "Cash" — for everything else, including vendor ACH payments, 
-                tax payments, payroll, utilities, insurance, rent, subscriptions, 
-                and ATM withdrawals
-             
-            Important:
-            - Include every single transaction without exception
-            - Do not skip any rows or summarize — one row per transaction
-            - Do not include opening balance, ending balance, or summary rows
-            - Checks always go in Class "Check", never in "Transfer" or "Cash"
-            - Never skip the first transaction row of any page. if a page begin with a transaction row (no section header), extract it. It is a continuation of the previous section.
-            - The word "FROM" in a transfer description always means money is entering the account → Amount Credit.
-            - The word "TO" in a transfer description always means money is leaving the account → Amount Debit.
-            - This applies regardless of how the transaction is labeled (Transfer, Zelle, Online Transfer, Wire, etc.)
-            - Use the section header of the statement (Deposits/Credits vs Withdrawals/Debits) to determine the correct column for any ambiguous transaction. Example: "Deposited OR Cashed Check" please check the column or section (Debit or Credit).
-            - If a page does not have a section header, assume it is a continuation of the last active section from the previous page. Use the section context to determine the correct amount column.
-            -No markdown, no explanation, no extra text — only the JSON array."""
+EXTRACTION_INSTRUCTIONS = """You are an expert OCR and financial data extraction AI.
+Your task is to extract every single transaction from this bank statement and return a JSON array.
+
+CRITICAL INSTRUCTIONS TO FIX COMMON ERRORS:
+
+1. MISSING TRANSACTIONS: 
+- Process the document strictly page by page, row by row. 
+- DO NOT skip any rows or summarize. ONE ROW PER TRANSACTION.
+- Use your thinking process to count the rows as you go. 
+- If a page begins with a transaction row without a section header, it is a continuation of the previous section. Extract it!
+
+2. WRONG COLUMNS (DEBIT VS CREDIT):
+- Always map amounts to Debit or Credit based on the column headers at the top of the table on the current page, or the section title.
+- Withdrawals, Payments, Purchases, Checks → Amount Debit (money leaving account).
+- Deposits, Additions, Credits → Amount Credit (money entering account).
+- "FROM" typically means money is entering (Credit). "TO" means money is leaving (Debit).
+- If an entire section is titled "Deposits", everything in it is a Credit. Pay attention to the layout!
+
+3. NUMBER CONFUSION (OCR ERRORS 1 vs 7):
+- Pay meticulous attention to digits. A '1' is a vertical line (sometimes with a small serif). A '7' has a distinct horizontal top bar.
+- '0' vs 'O', '8' vs 'B'. Look at the resolution and surrounding context.
+- If amounts don't make sense (e.g. math doesn't add up), look closer at the image.
+- Transcribe challenging rows verbatim in your thinking block before outputting them.
+
+OUTPUT FORMAT:
+Return a JSON array of objects. Each object must have these EXACT keys:
+
+- "Date": use MM/DD/YY format
+- "Description": the full transaction description as it appears
+- "Source": extract a clean, readable name of who sent/received the money (e.g. strip "POS DB", "WITHDRAWAL". "Zelle Payment To Juan" → "Zelle - Juan")
+- "Ref Number": for checks, the check number (e.g. "3245"). Otherwise leave blank.
+- "Account Number": the account number for this transaction as it appears. Repeat if only one account exists.
+- "Amount Debit": the withdrawal/debit amount as a positive number (leave blank if not applicable)
+- "Amount Credit": the deposit/credit amount as a positive number (leave blank if not applicable)
+- "Class": MUST be exactly one of: 
+  * "Credit Card" (Stripe, Square, Toast, Clover, Doordash, Uber Eats, autopay)
+  * "Transfer" (ACH, wire, Zelle, Online Transfer, ODP)
+  * "Check" (paid by check, has check number)
+  * "Cash" (everything else: vendor ACH, tax, payroll, ATM)
+
+IMPORTANT:
+- Do not include opening balance, ending balance, or summary rows.
+- No markdown formatting (no ```json). No preamble. ONLY output the JSON array."""
 
 
+AUDITOR_INSTRUCTIONS = """You are an expert Financial Auditor AI.
+Your task is to REVIEW and CORRECT a JSON array of extracted bank statement transactions against the original PDF document.
+
+CRITICAL INSTRUCTIONS:
+1. MISSING TRANSACTIONS: Read the document page by page and compare it to the provided JSON. If the OCR missed any transactions, ADD them to the array.
+2. WRONG COLUMNS: Verify the 'Amount Debit' and 'Amount Credit' for every transaction. If a withdrawal is accidentally in the credit column, MOVE it to Debit. Use the mathematical balance and section headers to verify.
+3. OCR ERRORS: Check for numbers that were misread (e.g. 7 vs 1, 0 vs O, 8 vs B). If the provided JSON has a suspicious amount, verify it against the image.
+4. REMOVE DUPLICATES: If there are duplicate rows, keep only one.
+
+The user will provide you with the PDF document and the CURRENT JSON extraction as a text block.
+Your output must be the FINAL, CORRECTED JSON array. No markdown fences, no preamble, only the raw JSON array."""
 
 def repair_incomplete_json(s):
     s = s.strip()
@@ -277,10 +257,11 @@ def process_file_with_claude(uploaded_file):
 
         response = client.messages.create(
             model="claude-sonnet-4-6",
-            max_tokens=16000,
+            max_tokens=40000,
+            timeout=1200.0,
             thinking={
                 "type": "enabled",
-                "budget_tokens": 5000,
+                "budget_tokens": 10000,
             },
             system=[
                 {
@@ -314,9 +295,13 @@ def process_file_with_claude(uploaded_file):
         # Con thinking activado, el array content puede tener bloques de tipo
         # "thinking" antes del bloque "text". Buscamos el texto explícitamente.
         text_block = next((b for b in response.content if b.type == "text"), None)
+        
         if not text_block:
             st.error("❌ Claude no devolvió un bloque de texto en la respuesta.")
+            st.write("Contenido de la respuesta:")
+            st.write(response.content)
             return []
+        
         raw_text = text_block.text.strip()
 
         raw_data = robust_json_loads(raw_text)
@@ -333,6 +318,78 @@ def process_file_with_claude(uploaded_file):
         return []
     except Exception as e:
         st.error(f"Error general: {e}")
+        st.code(traceback.format_exc())
+        return []
+
+
+def run_ai_validation(uploaded_file, current_json_data):
+    if not ANTHROPIC_API_KEY:
+        st.error("❌ Falta configurar ANTHROPIC_API_KEY en secrets.toml")
+        return []
+
+    file_bytes = uploaded_file.getvalue()
+    file_base64 = base64.b64encode(file_bytes).decode("utf-8")
+    
+    current_json_str = json.dumps(current_json_data, indent=2)
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        st.write("Enviando archivo y datos actuales a Claude para auditoría...")
+
+        response = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=40000,
+            timeout=1200.0,
+            thinking={
+                "type": "enabled",
+                "budget_tokens": 10000,
+            },
+            system=[
+                {
+                    "type": "text",
+                    "text": AUDITOR_INSTRUCTIONS,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "document",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "application/pdf",
+                                "data": file_base64,
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": f"Here is the CURRENT JSON extraction:\n{current_json_str}\n\nPlease review it against the PDF document, fix any errors, add missing transactions, and output the CORRECTED JSON array.",
+                        },
+                    ],
+                }
+            ],
+        )
+
+        st.write("✅ Auditoría completada.")
+        text_block = next((b for b in response.content if b.type == "text"), None)
+        
+        if not text_block:
+            st.error("❌ Claude no devolvió un texto válido en la auditoría.")
+            return []
+        
+        raw_text = text_block.text.strip()
+        raw_data = robust_json_loads(raw_text)
+
+        if raw_data:
+            return parse_response(raw_data)
+
+        return []
+
+    except Exception as e:
+        st.error(f"Error general en validación: {e}")
+        st.code(traceback.format_exc())
         return []
 
 
@@ -494,6 +551,23 @@ def main():
         m3.metric("🔴 Total Débitos",  f"${total_debit:,.2f}")
 
         st.divider()
+
+        if uploaded_file:
+            col1, col2 = st.columns([1, 1])
+            with col1:
+                if st.button("🕵️ Validar y Corregir con IA", use_container_width=True):
+                    with st.spinner("Claude está auditando los datos contra el PDF original. Esto tomará un momento..."):
+                        current_data = final_df.to_dict(orient='records')
+                        # Limpiar NaN values para que no rompan json.dumps
+                        current_data = [
+                            {k: (None if pd.isna(v) else v) for k, v in row.items()}
+                            for row in current_data
+                        ]
+                        corrected_data = run_ai_validation(uploaded_file, current_data)
+                        if corrected_data:
+                            st.session_state['processed_results'] = pd.DataFrame(corrected_data)
+                            st.success("¡Validación terminada! La tabla ha sido actualizada con las correcciones.")
+                            st.rerun()
 
         edited_df = st.data_editor(final_df, num_rows="dynamic", key="results_editor", use_container_width=True)
 
