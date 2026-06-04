@@ -3,3 +3,9 @@ pandas
 supabase
 anthropic
 openpyxl
+pillow
+numpy
+opencv-python-headless
+pymupdf
+rapidfuzz
+streamlit-image-comparison
